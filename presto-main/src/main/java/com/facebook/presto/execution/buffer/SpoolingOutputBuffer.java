@@ -30,12 +30,15 @@ import com.facebook.presto.spi.storage.TempStorageHandle;
 import com.facebook.presto.util.FinalizerService;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Range;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.SettableFuture;
 import io.airlift.slice.InputStreamSliceInput;
 import io.airlift.slice.SliceInput;
 import io.airlift.units.DataSize;
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.Immutable;
@@ -51,6 +54,7 @@ import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static com.facebook.presto.execution.buffer.BufferResult.emptyResults;
@@ -108,6 +112,8 @@ public class SpoolingOutputBuffer
 
     private final AtomicLong totalStorageBytesAdded = new AtomicLong();
     private final AtomicLong totalStoragePagesAdded = new AtomicLong();
+
+    private final AtomicReference<Exception> storageException = new AtomicReference<>();
 
     @GuardedBy("this")
     private final Deque<HandleInfo> handleInfoQueue = new LinkedList<>();
@@ -264,16 +270,28 @@ public class SpoolingOutputBuffer
 
         // create a future that will hold the handle
         ListenableFuture<TempStorageHandle> handleFuture = executor.submit(() -> {
-            try {
-                TempDataSink dataSink = tempStorage.create(tempDataOperationContext);
-                dataSink.write(dataOutputs);
-                return dataSink.commit();
-            }
-            catch (Exception e) {
-                log.error(e, "Failed to flush pages %s-%s", currentMemorySequenceId, currentMemorySequenceId + pageCount);
-                throw e;
-            }
+            TempDataSink dataSink = tempStorage.create(tempDataOperationContext);
+            dataSink.write(dataOutputs);
+            //throw new PrestoException(SPOOLING_STORAGE_ERROR, "Test exception that shows up when flushing");
+            return dataSink.commit();
         });
+
+        Futures.addCallback(handleFuture, new FutureCallback<TempStorageHandle>()
+        {
+            @Override
+            public void onSuccess(@Nullable TempStorageHandle result)
+            {
+                log.info("Successfully flush pages %s-%s", currentMemorySequenceId, currentMemorySequenceId + pageCount);
+            }
+
+            @Override
+            public void onFailure(Throwable t)
+            {
+                Exception exception = new PrestoException(SPOOLING_STORAGE_ERROR, "Failed to flush pages " + currentMemorySequenceId + "-" + pageCount, t);
+                storageException.compareAndSet(null, exception);
+                fail();
+            }
+        }, executor);
 
         // store the handleFuture and file information
         HandleInfo handleInfo = new HandleInfo(
@@ -390,8 +408,8 @@ public class SpoolingOutputBuffer
 
         Iterator<HandleInfo> handleInfoIterator = getTracker.getHandleInfos().iterator();
         HandleInfo handleInfo = handleInfoIterator.next();
-        ListenableFuture<TempStorageHandle> handleFuture = handleInfo.getHandleFuture();
-        return transformAsync(handleFuture, input -> getPagesFromStorage(ImmutableList.builder(), handleInfoIterator, input, getTracker), executor);
+        ListenableFuture<List<SerializedPage>> pages = transformAsync(handleInfo.getHandleFuture(), input -> getPagesFromStorage(ImmutableList.builder(), handleInfoIterator, input, getTracker), executor);
+        return catchingAsync(pages, Exception.class, e -> immediateFuture(ImmutableList.of()), executor);
     }
 
     private ListenableFuture<List<SerializedPage>> getPagesFromStorage(ImmutableList.Builder<SerializedPage> resultBuilder, Iterator<HandleInfo> handleIterator, TempStorageHandle handle, GetTracker getTracker)
@@ -422,10 +440,12 @@ public class SpoolingOutputBuffer
             if (!handleIterator.hasNext()) {
                 return immediateFuture(resultBuilder.build());
             }
-            return transformAsync(handleIterator.next().getHandleFuture(), input -> getPagesFromStorage(resultBuilder, handleIterator, input, getTracker), executor);
+            ListenableFuture<List<SerializedPage>> pages = transformAsync(handleIterator.next().getHandleFuture(), input -> getPagesFromStorage(resultBuilder, handleIterator, input, getTracker), executor);
+            return catchingAsync(pages, Exception.class, e -> immediateFuture(ImmutableList.of()), executor);
         }
         catch (IOException e) {
-            throw new PrestoException(SPOOLING_STORAGE_ERROR, "Failed to read file from TempStorage", e);
+            Exception exception = new PrestoException(SPOOLING_STORAGE_ERROR, "Failed to read file from TempStorage", e);
+            return immediateFailedFuture(exception);
         }
     }
 
@@ -624,6 +644,11 @@ public class SpoolingOutputBuffer
     public boolean isFinishedForLifespan(Lifespan lifespan)
     {
         return isFinished();
+    }
+
+    public Exception getStorageException()
+    {
+        return storageException.get();
     }
 
     private long getPagesSize(Collection<SerializedPage> pages)

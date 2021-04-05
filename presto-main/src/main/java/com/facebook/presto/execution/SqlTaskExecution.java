@@ -17,6 +17,7 @@ import com.facebook.airlift.concurrent.SetThreadName;
 import com.facebook.presto.event.SplitMonitor;
 import com.facebook.presto.execution.StateMachine.StateChangeListener;
 import com.facebook.presto.execution.buffer.BufferState;
+import com.facebook.presto.execution.buffer.LazyOutputBuffer;
 import com.facebook.presto.execution.buffer.OutputBuffer;
 import com.facebook.presto.execution.executor.TaskExecutor;
 import com.facebook.presto.execution.executor.TaskHandle;
@@ -244,6 +245,8 @@ public class SqlTaskExecution
             else {
                 taskHandle = null;
             }
+
+            outputBuffer.addStateChangeListener(new FailTaskOnBufferFail(SqlTaskExecution.this, taskStateMachine, outputBuffer));
 
             outputBuffer.addStateChangeListener(new CheckTaskCompletionOnBufferFinish(SqlTaskExecution.this));
             outputBuffer.registerLifespanCompletionCallback(status::checkLifespanCompletion);
@@ -1094,6 +1097,34 @@ public class SqlTaskExecution
 
             if (driver != null) {
                 driver.close();
+            }
+        }
+    }
+
+    private static final class FailTaskOnBufferFail
+            implements StateChangeListener<BufferState>
+    {
+        private final WeakReference<SqlTaskExecution> sqlTaskExecutionReference;
+        private final WeakReference<TaskStateMachine> taskStateMachineReference;
+        private final WeakReference<OutputBuffer> outputBufferReference;
+
+        public FailTaskOnBufferFail(SqlTaskExecution sqlTaskExecution, TaskStateMachine taskStateMachine, OutputBuffer outputBuffer)
+        {
+            this.sqlTaskExecutionReference = new WeakReference<>(sqlTaskExecution);
+            this.taskStateMachineReference = new WeakReference<>(taskStateMachine);
+            this.outputBufferReference = new WeakReference<>(outputBuffer);
+        }
+
+        @Override
+        public void stateChanged(BufferState newState)
+        {
+            SqlTaskExecution sqlTaskExecution = sqlTaskExecutionReference.get();
+            TaskStateMachine stateMachine = taskStateMachineReference.get();
+            OutputBuffer outputBuffer = outputBufferReference.get();
+            if (sqlTaskExecution != null && stateMachine != null) {
+                if (stateMachine.getState() != TaskState.FAILED && newState == BufferState.FAILED && outputBuffer.getInfo().getType() == "SPOOLING") {
+                    stateMachine.failed(((LazyOutputBuffer) outputBuffer).getSpoolingStorageException());
+                }
             }
         }
     }

@@ -353,6 +353,15 @@ public class LazyOutputBuffer
         return 0;
     }
 
+    public Exception getSpoolingStorageException()
+    {
+        OutputBuffer outputBuffer = getDelegateOutputBuffer();
+        checkState(outputBuffer != null, "Buffer has not been initialized");
+        checkState(outputBuffer.getInfo().getType() == "SPOOLING", "Buffer type is not type spooling");
+
+        return ((SpoolingOutputBuffer) outputBuffer).getStorageException();
+    }
+
     @Nullable
     private OutputBuffer getDelegateOutputBuffer()
     {
